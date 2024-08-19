@@ -11,7 +11,7 @@ from threading import RLock
 _LOGGER = logging.getLogger(__name__)
 ZONE_PATTERN_ON = re.compile("\D\D\D\s(\d\d)\D\D\d\d\s\s\D\D\D\s(\d\d)\D\D\d\d\s")
 ZONE_PATTERN_OFF = re.compile("\D\D\DOFF\D\D\d\d\s\s\D\D\D\D\D\D\D\D\d\d\s")
-ZONE_OUTPUT_STATE_PATTERN = re.compile("=    Video Output (?P<outNumber>\d+) : Input = (?P<inputNumber>\d+), Output = (?P<outputState>\w+) , LINK = (?P<linkState>\w+)")
+ZONE_OUTPUT_STATE_PATTERN = re.compile("=    Video Output (?P<outNumber>\d+) : Input = (?P<inputNumber>\d+), Output.=.(?P<outputState>\w{2,3})\s?,.LINK.=.(?P<linkState>\w+)")
 
 EOL = b"\r"
 LEN_EOL = len(EOL)
@@ -110,9 +110,9 @@ class ZoneStatus(object):
                     return None
 
                 if p[2] == "ON":
-                    return ZoneStatus(zone, 1, int(p[1]), 0)
+                    return ZoneStatus(zone, True, int(p[1]), 0)
                 else:
-                    return ZoneStatus(zone, 0, int(p[1]), 0)
+                    return ZoneStatus(zone, False, int(p[1]), 0)
         else:
             return None
 
@@ -203,7 +203,7 @@ def _format_set_zone_power(matrix_type: int, zone: int, power: bool) -> bytes:
     if matrix_type == 0:
         return "{}{}.\r".format(zone, "@" if power else "$").encode()
     elif matrix_type == 1:
-        if power:
+        if power == True:
             strCmd = "ON"
         else:
             strCmd = "OFF"
@@ -283,7 +283,8 @@ def get_blackbird(url, use_serial=True, matrix_type:int=0):
         def __init__(self, url, matrix_type):
             """Initialize the client."""
             self._matrix_type = matrix_type
-
+            self._matrix_type_1_first_zone = -1
+            
             if use_serial:
                 self._port = serial.serial_for_url(url, do_not_open=True)
                 self._port.baudrate = 9600
@@ -368,12 +369,16 @@ def get_blackbird(url, use_serial=True, matrix_type:int=0):
                     ),
                 )
             elif self._matrix_type == 1:
+                if zone == self._matrix_type_1_first_zone or self._matrix_type_1_first_zone == -1:
+                    self._matrix_type_1_first_zone = zone
+                    self._matrix_status = self._process_request(
+                        _format_zone_status_request(self._matrix_type, zone), skip=3835
+                    )
+                
                 return ZoneStatus.from_string(
                     self._matrix_type,
                     zone,
-                    self._process_request(
-                        _format_zone_status_request(self._matrix_type, zone), skip=3835
-                    ),
+                    self._matrix_status,
                 )
             else:
                 return None
@@ -448,9 +453,12 @@ async def get_async_blackbird(port_url, loop):
                     _format_zone_status_request(self._matrix_type, zone), skip=15
                 )
             elif self._matrix_type == 1:
-                string = await self._protocol.send(
-                    _format_zone_status_request(self._matrix_type, zone), skip=3840
-                )
+                if zone == self._matrix_type_1_first_zone or self._matrix_type_1_first_zone == -1:
+                    self._matrix_type_1_first_zone = zone
+                    self._matrix_status = await self._protocol.send(
+                        _format_zone_status_request(self._matrix_type, zone), skip=3840
+                    )                
+                string = self._matrix_status;
 
             return ZoneStatus.from_string(self._matrix_type, zone, string)
 
