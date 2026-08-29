@@ -8,6 +8,8 @@ from functools import wraps
 from serial_asyncio import create_serial_connection
 from threading import RLock
 
+from .profiles import BLACKBIRD_8X8, BlackbirdProfile
+
 _LOGGER = logging.getLogger(__name__)
 ZONE_PATTERN_ON = re.compile('\D\D\D\s(\d\d)\D\D\d\d\s\s\D\D\D\s(\d\d)\D\D\d\d\s')
 ZONE_PATTERN_OFF = re.compile('\D\D\DOFF\D\D\d\d\s\s\D\D\D\D\D\D\D\D\d\d\s')
@@ -137,7 +139,7 @@ def _format_lock_status() -> bytes:
     return '%9961.\r'.encode()
 
 
-def get_blackbird(url, use_serial=True):
+def get_blackbird(url, use_serial=True, profile: BlackbirdProfile = BLACKBIRD_8X8):
     """
     Return synchronous version of Blackbird interface
     :param port_url: serial port, i.e. '/dev/ttyUSB0'
@@ -158,6 +160,7 @@ def get_blackbird(url, use_serial=True):
             """
             Initialize the client.
             """
+            self.profile = profile
             if use_serial:
                 self._port = serial.serial_for_url(url, do_not_open=True)
                 self._port.baudrate = 9600
@@ -228,21 +231,26 @@ def get_blackbird(url, use_serial=True):
         @synchronized
         def zone_status(self, zone: int):
             # Returns status of a zone
+            self.profile.validate_zone(zone)
             return ZoneStatus.from_string(zone, self._process_request(_format_zone_status_request(zone), skip=20))
 
         @synchronized
         def set_zone_power(self, zone: int, power: bool):
             # Set zone power
+            self.profile.validate_zone(zone)
             self._process_request(_format_set_zone_power(zone, power))
 
         @synchronized
         def set_zone_source(self, zone: int, source: int):
             # Set zone source
+            self.profile.validate_zone(zone)
+            self.profile.validate_source(source)
             self._process_request(_format_set_zone_source(zone, source))
 
         @synchronized
         def set_all_zone_source(self, source: int):
             # Set all zones to one source
+            self.profile.validate_source(source)
             self._process_request(_format_set_all_zone_source(source))
 
         @synchronized
