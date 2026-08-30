@@ -5,11 +5,14 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class BlackbirdProfile:
-    """Defines the routable input and output range of a matrix model."""
+    """Defines the protocol and routable range of a matrix model."""
 
     name: str
     sources: int
     zones: int
+    tcp_port: int = 4001
+    response_terminator: bytes = b"\r"
+    legacy_protocol: bool = False
 
     def validate_source(self, source: int) -> int:
         """Validate a one-based source identifier."""
@@ -26,3 +29,11 @@ class BlackbirdProfile:
 
 BLACKBIRD_8X8 = BlackbirdProfile("8x8", sources=8, zones=8)
 BLACKBIRD_4X4 = BlackbirdProfile("4x4", sources=4, zones=4)
+BLACKBIRD_4X4_LEGACY = BlackbirdProfile(
+    "4x4 legacy (PID 15779)",
+    sources=4,
+    zones=4,
+    tcp_port=23,
+    response_terminator=b"\r\n",
+    legacy_protocol=True,
+)
