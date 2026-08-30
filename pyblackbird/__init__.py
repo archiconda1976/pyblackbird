@@ -139,10 +139,16 @@ def _format_lock_status() -> bytes:
     return '%9961.\r'.encode()
 
 
-def get_blackbird(url, use_serial=True, profile: BlackbirdProfile = BLACKBIRD_8X8):
+def get_blackbird(
+    url,
+    use_serial=True,
+    profile: BlackbirdProfile = BLACKBIRD_8X8,
+    port: int = PORT,
+):
     """
     Return synchronous version of Blackbird interface
     :param port_url: serial port, i.e. '/dev/ttyUSB0'
+    :param port: TCP port when ``use_serial`` is false
     :return: synchronous implementation of Blackbird interface
     """
     lock = RLock()
@@ -173,7 +179,7 @@ def get_blackbird(url, use_serial=True, profile: BlackbirdProfile = BLACKBIRD_8X
 
             else:
                 self.host = url
-                self.port = PORT
+                self.port = port
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.settimeout(TIMEOUT)
                 self.socket.connect((self.host, self.port))
@@ -271,7 +277,11 @@ def get_blackbird(url, use_serial=True, profile: BlackbirdProfile = BLACKBIRD_8X
     return BlackbirdSync(url)
 
 
-async def get_async_blackbird(port_url, loop):
+async def get_async_blackbird(
+    port_url,
+    loop,
+    profile: BlackbirdProfile = BLACKBIRD_8X8,
+):
     """
     Return asynchronous version of Blackbird interface
     :param port_url: serial port, i.e. '/dev/ttyUSB0'
@@ -283,30 +293,36 @@ async def get_async_blackbird(port_url, loop):
     def locked_coro(coro):
         @wraps(coro)
         async def wrapper(*args, **kwargs):
-            with (await lock):
-                return (await coro(*args, **kwargs))
+            async with lock:
+                return await coro(*args, **kwargs)
         return wrapper
 
     class BlackbirdAsync(Blackbird):
         def __init__(self, blackbird_protocol):
             self._protocol = blackbird_protocol
+            self.profile = profile
 
         @locked_coro
         async def zone_status(self, zone: int):
+            self.profile.validate_zone(zone)
             string = await self._protocol.send(_format_zone_status_request(zone), skip=15)
             return ZoneStatus.from_string(zone, string)
 
         @locked_coro
         async def set_zone_power(self, zone: int, power: bool):
+            self.profile.validate_zone(zone)
             await self._protocol.send(_format_set_zone_power(zone, power))
 
         @locked_coro
         async def set_zone_source(self, zone: int, source: int):
+            self.profile.validate_zone(zone)
+            self.profile.validate_source(source)
             await self._protocol.send(_format_set_zone_source(zone, source))
 
         @locked_coro
         async def set_all_zone_source(self, source: int):
-             await self._protocol.send(_format_set_all_zone_source(source))
+            self.profile.validate_source(source)
+            await self._protocol.send(_format_set_all_zone_source(source))
 
         @locked_coro
         async def lock_front_buttons(self):
@@ -324,11 +340,10 @@ async def get_async_blackbird(port_url, loop):
     class BlackbirdProtocol(asyncio.Protocol):
         def __init__(self, loop):
             super().__init__()
-            self._loop = loop
             self._lock = asyncio.Lock()
             self._transport = None
-            self._connected = asyncio.Event(loop=loop)
-            self.q = asyncio.Queue(loop=loop)
+            self._connected = asyncio.Event()
+            self.q = asyncio.Queue()
 
         def connection_made(self, transport):
             self._transport = transport
@@ -336,13 +351,13 @@ async def get_async_blackbird(port_url, loop):
             _LOGGER.debug('port opened %s', self._transport)
 
         def data_received(self, data):
-            asyncio.ensure_future(self.q.put(data), loop=self._loop)
+            self.q.put_nowait(data)
 
         async def send(self, request: bytes, skip=0):
             await self._connected.wait()
             result = bytearray()
             # Only one transaction at a time
-            with (await self._lock):
+            async with self._lock:
                 self._transport.serial.reset_output_buffer()
                 self._transport.serial.reset_input_buffer()
                 while not self.q.empty():
@@ -350,7 +365,7 @@ async def get_async_blackbird(port_url, loop):
                 self._transport.write(request)
                 try:
                     while True:
-                        result += await asyncio.wait_for(self.q.get(), TIMEOUT, loop=self._loop)
+                        result += await asyncio.wait_for(self.q.get(), TIMEOUT)
                         if len(result) > skip and result[-LEN_EOL:] == EOL:
                             ret = bytes(result)
                             _LOGGER.debug('Received "%s"', ret)
