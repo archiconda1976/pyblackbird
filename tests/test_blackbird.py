@@ -4,7 +4,11 @@ import serialx
 import socket
 
 from pyblackbird import (get_blackbird, get_async_blackbird, ZoneStatus)
-from pyblackbird.profiles import BLACKBIRD_4X4, BLACKBIRD_8X8
+from pyblackbird.profiles import (
+    BLACKBIRD_4X4,
+    BLACKBIRD_4X4_LEGACY,
+    BLACKBIRD_8X8,
+)
 from tests import (create_dummy_port, create_dummy_socket)
 import asyncio
 
@@ -31,6 +35,22 @@ class TestZoneStatus(unittest.TestCase):
             self.assertFalse(status.power)
             self.assertIsNone(status.av)
             self.assertIsNone(status.ir)
+
+    def test_legacy_4x4_global_status(self):
+        response = "\r\n".join(
+            (
+                "=    Video Output 1 : Input = 2, Output = ON , LINK = ON",
+                "=    Video Output 2 : Input = 3, Output = OFF, LINK = ON",
+                "=    Video Output 3 : Input = 1, Output = ON, LINK = ON",
+                "=    Video Output 4 : Input = 4, Output = ON, LINK = ON",
+            )
+        )
+
+        status = ZoneStatus.from_legacy_4x4_status(2, response)
+
+        self.assertEqual(2, status.zone)
+        self.assertFalse(status.power)
+        self.assertEqual(3, status.av)
 
 class TestBlackbird(unittest.TestCase):
     def setUp(self):
@@ -122,6 +142,28 @@ class TestBlackbirdProfiles(unittest.TestCase):
             blackbird.set_zone_source(1, 5)
         with self.assertRaises(ValueError):
             blackbird.set_all_zone_source(5)
+
+    def test_legacy_4x4_profile_uses_legacy_transport(self):
+        self.assertEqual(23, BLACKBIRD_4X4_LEGACY.tcp_port)
+        self.assertEqual(b"\r\n", BLACKBIRD_4X4_LEGACY.response_terminator)
+        self.assertTrue(BLACKBIRD_4X4_LEGACY.legacy_protocol)
+
+    def test_legacy_4x4_status_is_shared_by_all_zones(self):
+        blackbird = get_blackbird(
+            create_dummy_port(self.responses), profile=BLACKBIRD_4X4_LEGACY
+        )
+        self.responses[b">@RSTA\r"] = "\r\n".join(
+            (
+                "=    Video Output 1 : Input = 2, Output = ON , LINK = ON",
+                "=    Video Output 2 : Input = 3, Output = OFF, LINK = ON",
+                "=    Video Output 3 : Input = 1, Output = ON, LINK = ON",
+                "=    Video Output 4 : Input = 4, Output = ON, LINK = ON\r\n",
+            )
+        ).encode()
+
+        self.assertEqual(2, blackbird.zone_status(1).av)
+        self.assertFalse(blackbird.zone_status(2).power)
+        self.assertEqual(0, len(self.responses))
 
     def test_8x8_profile_accepts_maximum_ids(self):
         blackbird = get_blackbird(

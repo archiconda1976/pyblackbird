@@ -7,6 +7,7 @@ import socket
 from functools import wraps
 from serialx import create_serial_connection
 from threading import RLock
+from typing import Optional
 
 from .profiles import BLACKBIRD_8X8, BlackbirdProfile
 
@@ -29,6 +30,10 @@ SOCKET_RECV = 2048
 ZONE_STATUS_SKIP = 20
 ZONE_STATUS_SKIP_NO_IR = 10
 ZONE_STATUS_SKIP_ASYNC = 15
+LEGACY_4X4_STATUS_PATTERN = re.compile(
+    r"=    Video Output (?P<output>\d+) : Input = (?P<input>\d+), "
+    r"Output.=.(?P<power>\w{2,3})\s?,.LINK.=.(?P<link>\w+)"
+)
 
 class ZoneStatus(object):
     def __init__(self,
@@ -55,6 +60,23 @@ class ZoneStatus(object):
         if re.search(ZONE_PATTERN_OFF, string) or re.search(ZONE_PATTERN_OFF_NO_IR, string):
             return ZoneStatus(zone, 0, None, None)
         return None
+
+    @classmethod
+    def from_legacy_4x4_status(cls, zone: int, string: str):
+        """Create a zone status from a legacy PID 15779 global status reply."""
+        status_by_zone = {
+            int(match.group("output")): match
+            for match in LEGACY_4X4_STATUS_PATTERN.finditer(string)
+        }
+        match = status_by_zone.get(zone)
+        if match is None:
+            return None
+        return ZoneStatus(
+            zone,
+            match.group("power") == "ON",
+            int(match.group("input")),
+            0,
+        )
 
 class LockStatus(object):
     def __init__(self,
@@ -129,17 +151,32 @@ class Blackbird(object):
 
 # Helpers
 
-def _format_zone_status_request(zone: int) -> bytes:
+def _format_zone_status_request(profile: BlackbirdProfile, zone: int) -> bytes:
+    if profile.legacy_protocol:
+        return b">@RSTA\r\b"
     return 'Status{}.\r'.format(zone).encode()
 
-def _format_set_zone_power(zone: int, power: bool) -> bytes:
+def _format_set_zone_power(
+    profile: BlackbirdProfile, zone: int, power: bool
+) -> bytes:
+    if profile.legacy_protocol:
+        return f">@WVSO[{zone}]{'ON' if power else 'OFF'}\r\n".encode()
     return '{}{}.\r'.format(zone, '@' if power else '$').encode()
 
-def _format_set_zone_source(zone: int, source: int, ir_control: bool = True) -> bytes:
+def _format_set_zone_source(
+    profile: BlackbirdProfile,
+    zone: int,
+    source: int,
+    ir_control: bool = True,
+) -> bytes:
+    if profile.legacy_protocol:
+        return f">@WVSO[{zone}]I[{source}]\r\n".encode()
     source = int(max(1, min(source,8)))
     return '{}{}{}.\r'.format(source, 'B' if ir_control else 'V', zone).encode()
 
-def _format_set_all_zone_source(source: int) -> bytes:
+def _format_set_all_zone_source(profile: BlackbirdProfile, source: int) -> bytes:
+    if profile.legacy_protocol:
+        return f">@WVSOA[{source}]\r\n".encode()
     source = int(max(1, min(source,8)))
     return '{}All.\r'.format(source).encode()
 
@@ -158,7 +195,7 @@ def get_blackbird(
     use_serial=True,
     ir_control=True,
     profile: BlackbirdProfile = BLACKBIRD_8X8,
-    port: int = PORT,
+    port: Optional[int] = None,
 ):
     """
     Return synchronous version of Blackbird interface
@@ -182,6 +219,8 @@ def get_blackbird(
             Initialize the client.
             """
             self.profile = profile
+            self._legacy_4x4_first_zone = None
+            self._legacy_4x4_status = ""
             if use_serial:
                 self._port = serialx.serial_for_url(
                     url,
@@ -196,7 +235,7 @@ def get_blackbird(
 
             else:
                 self.host = url
-                self.port = port
+                self.port = profile.tcp_port if port is None else port
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.socket.settimeout(TIMEOUT)
                 self.socket.connect((self.host, self.port))
@@ -204,7 +243,7 @@ def get_blackbird(
                 # Clear login message
                 self.socket.recv(SOCKET_RECV)
 
-        def _process_request(self, request: bytes, skip=0):
+        def _process_request(self, request: bytes, skip=0, response_complete=None):
             """
             Send data to socket
             :param request: request that is sent to the blackbird
@@ -230,55 +269,87 @@ def get_blackbird(
                         raise serialx.SerialTimeoutException(
                             'Connection timed out! Last received bytes {}'.format([hex(a) for a in result]))
                     result += c
-                    if len(result) > skip and result [-LEN_EOL:] == EOL:
+                    if response_complete:
+                        if response_complete(bytes(result)):
+                            break
+                    elif (
+                        len(result) > skip
+                        and result[-len(self.profile.response_terminator):]
+                        == self.profile.response_terminator
+                    ):
                         break
                 ret = bytes(result)
                 _LOGGER.debug('Received "%s"', ret)
                 return ret.decode('ascii')
 
             else:
-                self.socket.send(request)
+                self.socket.sendall(request)
 
-                response = ''
+                response = bytearray()
 
                 while True:
 
                     data = self.socket.recv(SOCKET_RECV)
-                    response += data.decode('ascii')
+                    if not data:
+                        raise ConnectionError("Blackbird controller closed the connection")
+                    response += data
                     
-                    if EOL in data and len(response) > skip:
+                    if response_complete:
+                        if response_complete(bytes(response)):
+                            break
+                    elif (
+                        len(response) > skip
+                        and response.endswith(self.profile.response_terminator)
+                    ):
                         break
 
-                return response
+                return response.decode("ascii")
 
         @synchronized
         def zone_status(self, zone: int):
             # Returns status of a zone
             skip = ZONE_STATUS_SKIP if ir_control else ZONE_STATUS_SKIP_NO_IR
             self.profile.validate_zone(zone)
+            if self.profile.legacy_protocol:
+                if self._legacy_4x4_first_zone in (None, zone):
+                    self._legacy_4x4_first_zone = zone
+                    self._legacy_4x4_status = self._process_request(
+                        _format_zone_status_request(self.profile, zone),
+                        response_complete=lambda data: len(
+                            LEGACY_4X4_STATUS_PATTERN.findall(data.decode("ascii"))
+                        )
+                        >= self.profile.zones,
+                    )
+                return ZoneStatus.from_legacy_4x4_status(
+                    zone, self._legacy_4x4_status
+                )
             return ZoneStatus.from_string(
                 zone,
-                self._process_request(_format_zone_status_request(zone), skip=skip),
+                self._process_request(
+                    _format_zone_status_request(self.profile, zone), skip=skip
+                ),
             )
 
         @synchronized
         def set_zone_power(self, zone: int, power: bool):
             # Set zone power
             self.profile.validate_zone(zone)
-            self._process_request(_format_set_zone_power(zone, power))
+            self._process_request(_format_set_zone_power(self.profile, zone, power))
 
         @synchronized
         def set_zone_source(self, zone: int, source: int):
             # Set zone source
             self.profile.validate_zone(zone)
             self.profile.validate_source(source)
-            self._process_request(_format_set_zone_source(zone, source, ir_control))
+            self._process_request(
+                _format_set_zone_source(self.profile, zone, source, ir_control)
+            )
 
         @synchronized
         def set_all_zone_source(self, source: int):
             # Set all zones to one source
             self.profile.validate_source(source)
-            self._process_request(_format_set_all_zone_source(source))
+            self._process_request(_format_set_all_zone_source(self.profile, source))
 
         @synchronized
         def lock_front_buttons(self):
@@ -327,26 +398,39 @@ async def get_async_blackbird(
 
         @locked_coro
         async def zone_status(self, zone: int):
-            skip = ZONE_STATUS_SKIP_ASYNC if ir_control else ZONE_STATUS_SKIP_NO_IR
-            string = await self._protocol.send(_format_zone_status_request(zone), skip=skip)
             self.profile.validate_zone(zone)
+            if self.profile.legacy_protocol:
+                string = await self._protocol.send(
+                    _format_zone_status_request(self.profile, zone),
+                    response_complete=lambda data: len(
+                        LEGACY_4X4_STATUS_PATTERN.findall(data.decode("ascii"))
+                    )
+                    >= self.profile.zones,
+                )
+                return ZoneStatus.from_legacy_4x4_status(zone, string)
+            skip = ZONE_STATUS_SKIP_ASYNC if ir_control else ZONE_STATUS_SKIP_NO_IR
+            string = await self._protocol.send(
+                _format_zone_status_request(self.profile, zone), skip=skip
+            )
             return ZoneStatus.from_string(zone, string)
 
         @locked_coro
         async def set_zone_power(self, zone: int, power: bool):
             self.profile.validate_zone(zone)
-            await self._protocol.send(_format_set_zone_power(zone, power))
+            await self._protocol.send(_format_set_zone_power(self.profile, zone, power))
 
         @locked_coro
         async def set_zone_source(self, zone: int, source: int):
             self.profile.validate_zone(zone)
             self.profile.validate_source(source)
-            await self._protocol.send(_format_set_zone_source(zone, source, ir_control))
+            await self._protocol.send(
+                _format_set_zone_source(self.profile, zone, source, ir_control)
+            )
 
         @locked_coro
         async def set_all_zone_source(self, source: int):
             self.profile.validate_source(source)
-            await self._protocol.send(_format_set_all_zone_source(source))
+            await self._protocol.send(_format_set_all_zone_source(self.profile, source))
 
         @locked_coro
         async def lock_front_buttons(self):
@@ -362,8 +446,9 @@ async def get_async_blackbird(
             return LockStatus.from_string(string)
 
     class BlackbirdProtocol(asyncio.Protocol):
-        def __init__(self, loop):
+        def __init__(self, loop, profile):
             super().__init__()
+            self._profile = profile
             self._lock = asyncio.Lock()
             self._transport = None
             self._connected = asyncio.Event()
@@ -377,7 +462,7 @@ async def get_async_blackbird(
         def data_received(self, data):
             self.q.put_nowait(data)
 
-        async def send(self, request: bytes, skip=0):
+        async def send(self, request: bytes, skip=0, response_complete=None):
             await self._connected.wait()
             result = bytearray()
             # Only one transaction at a time
@@ -390,7 +475,15 @@ async def get_async_blackbird(
                 try:
                     while True:
                         result += await asyncio.wait_for(self.q.get(), TIMEOUT)
-                        if len(result) > skip and result[-LEN_EOL:] == EOL:
+                        if response_complete and response_complete(bytes(result)):
+                            ret = bytes(result)
+                            _LOGGER.debug('Received "%s"', ret)
+                            return ret.decode('ascii')
+                        if (
+                            len(result) > skip
+                            and result[-len(self._profile.response_terminator):]
+                            == self._profile.response_terminator
+                        ):
                             ret = bytes(result)
                             _LOGGER.debug('Received "%s"', ret)
                             return ret.decode('ascii')
@@ -398,6 +491,11 @@ async def get_async_blackbird(
                     _LOGGER.error("Timeout during receiving response for command '%s', received='%s'", request, result)
                     raise
 
-    _, protocol = await create_serial_connection(loop, functools.partial(BlackbirdProtocol, loop), port_url, baudrate=9600)
+    _, protocol = await create_serial_connection(
+        loop,
+        functools.partial(BlackbirdProtocol, loop, profile),
+        port_url,
+        baudrate=9600,
+    )
 
     return BlackbirdAsync(protocol)
